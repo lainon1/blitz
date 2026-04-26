@@ -1,11 +1,11 @@
-use cssparser::ParserInput;
+use cssparser::{ParserInput, TokenSerializationType};
 use linebender_resource_handle::Blob;
 use markup5ever::{LocalName, QualName, local_name};
 use parley::{ContentWidths, FontContext, LayoutContext};
 use selectors::matching::QuirksMode;
 use std::str::FromStr;
 use std::sync::Arc;
-use style::Atom;
+use style::custom_properties::{self, VariableValue};
 use style::parser::ParserContext;
 use style::properties::{Importance, PropertyDeclaration, PropertyId, SourcePropertyDeclaration};
 use style::stylesheets::{DocumentStyleSheet, Origin, UrlExtraData};
@@ -17,6 +17,8 @@ use style::{
 };
 use style_traits::ParsingMode;
 use url::Url;
+
+use style::Atom;
 
 use super::{Attribute, Attributes};
 use crate::Document;
@@ -329,6 +331,10 @@ impl ElementData {
         guard: &SharedRwLock,
         url_extra_data: UrlExtraData,
     ) -> bool {
+        if name.starts_with("--") {
+            return self.set_custom_property(name, value, guard, url_extra_data);
+        }
+
         let context = ParserContext::new(
             Origin::Author,
             &url_extra_data,
@@ -371,12 +377,58 @@ impl ElementData {
         true
     }
 
+    fn set_custom_property(
+        &mut self,
+        name: &str,
+        value: &str,
+        guard: &SharedRwLock,
+        url_extra_data: UrlExtraData,
+    ) -> bool {
+        let custom_name = match custom_properties::parse_name(name) {
+            Ok(name) => custom_properties::Name::from(name),
+            Err(()) => {
+                #[cfg(feature = "tracing")]
+                tracing::warn!(property = name, "Invalid custom property name");
+                return false;
+            }
+        };
+
+        let variable_value = VariableValue::new(
+            value.to_string(),
+            &url_extra_data,
+            TokenSerializationType::default(),
+            TokenSerializationType::default(),
+            false,
+        );
+
+        let mut source_property_declaration = SourcePropertyDeclaration::default();
+        source_property_declaration.push(PropertyDeclaration::Custom(style::properties::CustomDeclaration {
+            name: custom_name,
+            value: style::properties::CustomDeclarationValue::Unparsed(ServoArc::new(variable_value)),
+        }));
+
+        if self.style_attribute.is_none() {
+            self.style_attribute = Some(ServoArc::new(guard.wrap(PropertyDeclarationBlock::new())));
+        }
+        self.style_attribute
+            .as_mut()
+            .unwrap()
+            .write_with(&mut guard.write())
+            .extend(source_property_declaration.drain(), Importance::Normal);
+
+        true
+    }
+
     pub fn remove_style_property(
         &mut self,
         name: &str,
         guard: &SharedRwLock,
         url_extra_data: UrlExtraData,
     ) -> bool {
+        if name.starts_with("--") {
+            return self.remove_custom_property(name, guard, url_extra_data);
+        }
+
         let context = ParserContext::new(
             Origin::Author,
             &url_extra_data,
@@ -396,6 +448,34 @@ impl ElementData {
         if let Some(style) = &mut self.style_attribute {
             let mut guard = guard.write();
             let style = style.write_with(&mut guard);
+            if let Some(index) = style.first_declaration_to_remove(&property_id) {
+                style.remove_property(&property_id, index);
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn remove_custom_property(
+        &mut self,
+        name: &str,
+        guard: &SharedRwLock,
+        _url_extra_data: UrlExtraData,
+    ) -> bool {
+        let custom_name = match custom_properties::parse_name(name) {
+            Ok(name) => custom_properties::Name::from(name),
+            Err(()) => {
+                #[cfg(feature = "tracing")]
+                tracing::warn!(property = name, "Invalid custom property name");
+                return false;
+            }
+        };
+
+        if let Some(style) = &mut self.style_attribute {
+            let mut guard = guard.write();
+            let style = style.write_with(&mut guard);
+            let property_id = PropertyId::Custom(custom_name);
             if let Some(index) = style.first_declaration_to_remove(&property_id) {
                 style.remove_property(&property_id, index);
                 return true;
